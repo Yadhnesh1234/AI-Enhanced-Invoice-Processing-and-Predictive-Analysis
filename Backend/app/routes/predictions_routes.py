@@ -1,5 +1,5 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException
-from services.prediction_service import combine_csv_files,perform_kmeans_clustering,run_apriori_association
+from services.prediction_service import combine_csv_files,perform_kmeans_clustering,get_high_recency_prod
 from mlxtend.frequent_patterns import apriori,association_rules
 from mlxtend.preprocessing import TransactionEncoder
 import pandas as pd
@@ -8,20 +8,19 @@ import re
 router = APIRouter()
 
 path1 = "./data/combine_dataset_2009_2011.csv"
-# path2 = "./data/Year 2010-2011.csv"
 ds=pd.read_csv(path1)
-#ds=ds[ds['StockCode'].str.isnumeric()]
 
 @router.get("/frequent-customer-behaviour/")
-async def frequent_purchase_items():
+async def frequent_purchase_items(type):
     try:
-       
-       cluster_info = perform_kmeans_clustering(ds)
+       rfm_analysis = perform_kmeans_clustering(ds)
+       data=[]
+       if(type=="high_recency"):
+            data=get_high_recency_prod(ds,rfm_analysis)
        
        return {
-        "response": cluster_info
+        "response": data
        }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing invoice: {str(e)}")
     

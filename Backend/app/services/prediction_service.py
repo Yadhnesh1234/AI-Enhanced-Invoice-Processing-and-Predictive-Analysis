@@ -1,11 +1,12 @@
 import pandas as pd
 from typing import Optional
 import pandas as pd
+import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
-from mlxtend.frequent_patterns import apriori, association_rules
-from mlxtend.preprocessing import TransactionEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
 
 def combine_csv_files(file1_path: str, file2_path: str, output_path: Optional[str] = None) -> pd.DataFrame:
     df1 = pd.read_csv(file1_path)
@@ -19,133 +20,93 @@ def combine_csv_files(file1_path: str, file2_path: str, output_path: Optional[st
 
 def perform_kmeans_clustering(ds: pd.DataFrame) -> dict:
     ds = ds.dropna()
-    ds['Amount'] = ds['Quantity'] * ds['Price']
-    
-    # Group by StockCode instead of Customer ID
-    rfm_ds_m = ds.groupby('StockCode')['Amount'].sum().reset_index()
-    rfm_ds_m.columns = ['StockCode', 'Amount']
-    
-    # Calculate Recency (Days since last purchase)
     ds['InvoiceDate'] = pd.to_datetime(ds['InvoiceDate'], errors='coerce')
-    max_date = max(ds['InvoiceDate'])
-    ds['Diff'] = max_date - ds['InvoiceDate']
-    rfm_ds_p = ds.groupby('StockCode')['Diff'].min().reset_index()
-    rfm_ds_p.columns = ['StockCode', 'Diff']
-    rfm_ds_p['Diff'] = rfm_ds_p['Diff'].dt.days
-    
-    # Calculate Frequency (Number of purchases per StockCode)
-    rfm_ds_f = ds.groupby('StockCode')['Invoice'].count().reset_index()
-    rfm_ds_f.columns = ['StockCode', 'Frequency']
-    
-    # Merge RFM metrics
-    rfm_ds_final = pd.merge(rfm_ds_m, rfm_ds_f, on='StockCode', how='inner')
-    rfm_ds_final = pd.merge(rfm_ds_final, rfm_ds_p, on='StockCode', how='inner')
-    rfm_ds_final.columns = ['StockCode', 'Amount', 'Frequency', 'Recency']
+    max_date = ds['InvoiceDate'].max()
 
-    # Remove outliers
-    for column in ['Amount', 'Frequency', 'Recency']:
-        Q1 = rfm_ds_final[column].quantile(0.05)
-        Q3 = rfm_ds_final[column].quantile(0.95)
+    recency_df = ds.groupby('StockCode')['InvoiceDate'].max().reset_index()
+    recency_df['Recency'] = (max_date - recency_df['InvoiceDate']).dt.days
+    recency_df.drop(columns=['InvoiceDate'], inplace=True)
+
+    frequency_df = ds.groupby('StockCode')['Invoice'].nunique().reset_index()
+    frequency_df.columns = ['StockCode', 'Frequency']
+
+    ds['TotalSales'] = ds['Quantity'] * ds['Price']
+    monetary_df = ds.groupby('StockCode')['TotalSales'].sum().reset_index()
+    monetary_df.columns = ['StockCode', 'Monetary']
+
+    rfm_df = recency_df.merge(frequency_df, on='StockCode').merge(monetary_df, on='StockCode')
+
+    for col in ['Recency', 'Frequency', 'Monetary']:
+        Q1 = rfm_df[col].quantile(0.05)
+        Q3 = rfm_df[col].quantile(0.95)
         IQR = Q3 - Q1
-        rfm_ds_final = rfm_ds_final[(rfm_ds_final[column] >= Q1 - 1.5 * IQR) & (rfm_ds_final[column] <= Q3 + 1.5 * IQR)]
+        rfm_df = rfm_df[(rfm_df[col] >= Q1 - 1.5 * IQR) & (rfm_df[col] <= Q3 + 1.5 * IQR)]
 
-    # Scale data
-    X = rfm_ds_final[['Amount', 'Frequency', 'Recency']]
     scaler = MinMaxScaler()
-    rfm_ds_scaled = scaler.fit_transform(X)
-    rfm_ds_scaled = pd.DataFrame(rfm_ds_scaled, columns=['Amount', 'Frequency', 'Recency'])
+    rfm_scaled = scaler.fit_transform(rfm_df[['Recency', 'Frequency', 'Monetary']])
+ 
+    optimal_k = 3  
+    kmeans = KMeans(n_clusters=optimal_k, max_iter=50, random_state=42)
+    rfm_df['Cluster'] = kmeans.fit_predict(rfm_scaled)
 
-    # KMeans Clustering
-    kmeans = KMeans(n_clusters=3, max_iter=50, random_state=42)
-    kmeans.fit(rfm_ds_scaled)
-    rfm_ds_final['Cluster'] = kmeans.labels_
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+    description_vectors = vectorizer.fit_transform(ds.groupby('StockCode')['Description'].first().fillna(""))
 
-    # Identify clusters with highest Recency, Frequency, and Amount
-    cluster_summary = rfm_ds_final.groupby('Cluster').agg({
-        'Amount': 'mean',
+    svd = TruncatedSVD(n_components=5, random_state=42)
+    reduced_vectors = svd.fit_transform(description_vectors)
+
+    kmeans_desc = KMeans(n_clusters=5, random_state=42)
+    category_labels = kmeans_desc.fit_predict(reduced_vectors)
+
+    product_categories = pd.DataFrame({
+        'StockCode': ds['StockCode'].unique(),
+        'ProductCategory': category_labels
+    })
+
+    rfm_df = rfm_df.merge(product_categories, on='StockCode', how='left')
+
+    cluster_summary = rfm_df.groupby('Cluster').agg({
+        'Recency': 'mean',
         'Frequency': 'mean',
-        'Recency': 'mean'
+        'Monetary': 'mean'
     }).reset_index()
 
-    # Find clusters with highest values for each metric
     highest_recency_cluster = cluster_summary.loc[cluster_summary['Recency'].idxmax(), 'Cluster']
     highest_frequency_cluster = cluster_summary.loc[cluster_summary['Frequency'].idxmax(), 'Cluster']
-    highest_amount_cluster = cluster_summary.loc[cluster_summary['Amount'].idxmax(), 'Cluster']
+    highest_amount_cluster = cluster_summary.loc[cluster_summary['Monetary'].idxmax(), 'Cluster']
 
-    # Extract StockCodes for each of these clusters
-    highest_recency_stockcodes = rfm_ds_final[rfm_ds_final['Cluster'] == highest_recency_cluster]['StockCode'].tolist()
-    highest_frequency_stockcodes = rfm_ds_final[rfm_ds_final['Cluster'] == highest_frequency_cluster]['StockCode'].tolist()
-    highest_amount_stockcodes = rfm_ds_final[rfm_ds_final['Cluster'] == highest_amount_cluster]['StockCode'].tolist()
+    highest_recency_stockcodes = rfm_df[rfm_df['Cluster'] == highest_recency_cluster]['StockCode'].tolist()
+    highest_frequency_stockcodes = rfm_df[rfm_df['Cluster'] == highest_frequency_cluster]['StockCode'].tolist()
+    highest_amount_stockcodes = rfm_df[rfm_df['Cluster'] == highest_amount_cluster]['StockCode'].tolist()
 
-    # Return the clustered data and cluster information
-    return {
-        "highest_recency_cluster": {
-            "cluster": int(highest_recency_cluster),
-            "stockcodes": highest_recency_stockcodes
-        },
-        "highest_frequency_cluster": {
-            "cluster": int(highest_frequency_cluster),
-            "stockcodes": highest_frequency_stockcodes
-        },
-        "highest_amount_cluster": {
-            "cluster": int(highest_amount_cluster),
-            "stockcodes": highest_amount_stockcodes
-        },
-        "cluster_summary": cluster_summary.to_dict(orient='records')
-    }
-    
-def filter_last_n_months(ds: pd.DataFrame, months: int = 2) -> pd.DataFrame:
-    ds['InvoiceDate'] = pd.to_datetime(ds['InvoiceDate'])
-    last_date = ds['InvoiceDate'].max()
-    cutoff_date = last_date - pd.DateOffset(months=months)
-    return ds[ds['InvoiceDate'] >= cutoff_date]
+    return rfm_df
 
-def prepare_transaction_data(ds: pd.DataFrame, min_items=2, min_freq=5) -> list:
-    product_counts = ds['StockCode'].value_counts()
-    frequent_products = product_counts[product_counts >= min_freq].index
-    ds_filtered = ds[ds['StockCode'].isin(frequent_products)]
-    
-    transactions = ds_filtered.groupby('Invoice')['StockCode'].apply(list).tolist()
-    return [t for t in transactions if len(t) >= min_items]
+def get_high_recency_prod(ds: pd.DataFrame, rfm_df: pd.DataFrame) -> list:
+    rfm_df = rfm_df.replace([np.inf, -np.inf], np.nan).dropna()
+    cluster_summary = rfm_df.groupby('Cluster').agg({'Recency': 'mean'}).reset_index()
+    if cluster_summary['Recency'].isnull().all():
+        return [] 
+    highest_recency_cluster = int(cluster_summary.loc[cluster_summary['Recency'].idxmax(), 'Cluster'])
+    max_recency_stockcodes = rfm_df[rfm_df['Cluster'] == highest_recency_cluster]['StockCode'].astype(str).tolist()
+    product_names = ds[['StockCode', 'Description']].drop_duplicates()
+    max_recency_products = product_names[product_names['StockCode'].astype(str).isin(max_recency_stockcodes)]
+    return max_recency_products.fillna("").to_dict(orient="records")
 
-def encode_transactions(transactions: list) -> pd.DataFrame:
-    te = TransactionEncoder()
-    te_ary = te.fit(transactions).transform(transactions, sparse=True)  
-    return pd.DataFrame.sparse.from_spmatrix(te_ary, columns=te.columns_)
+import numpy as np
 
-def find_product_associations_apriori(df: pd.DataFrame, min_support: float = 0.005) -> pd.DataFrame:
-    frequent_itemsets = apriori(df, min_support=min_support, use_colnames=True)
-    
-    if frequent_itemsets.empty:
-        print("⚠️ No frequent itemsets found! Try reducing min_support.")
-    
-    return frequent_itemsets
-
-def generate_association_rules(frequent_itemsets: pd.DataFrame, min_lift: float = 0.5) -> pd.DataFrame:
-    if frequent_itemsets.empty:
-        return pd.DataFrame()
-    
-    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=min_lift)
-    
-    if rules.empty:
-        print("⚠️ No association rules found! Try reducing min_lift.")
-    
-    return rules
-
-def hot_encode(x): 
-    if(x<= 0): 
-        return 0
-    if(x>= 1): 
-        return 1
-def run_apriori_association(data):
-       data['Description'] = data['Description'].str.strip()  
-       data.dropna(axis = 0, subset =['Invoice'], inplace = True) 
-       data['Invoice'] = data['Invoice'].astype('str')  
-       data = data[~data['Invoice'].str.contains('C')] 
-       basket=data.groupby(['Invoice', 'Description'])['Quantity'] .sum().unstack().reset_index().fillna(0).set_index('Invoice') 
-       basket_encoded = basket.applymap(hot_encode) 
-       basket= basket_encoded 
-       frq_items = apriori(basket, min_support=0.02, use_colnames=True)
-       rules = association_rules(frq_items, metric="lift", min_threshold=1, support_only=False,num_itemsets=len(frq_items))
-       rules = rules.sort_values(['confidence', 'lift'], ascending=[False, False])
-       return rules.head()
+def get_high_amount_high_frequency_prod(ds: pd.DataFrame, rfm_df: pd.DataFrame) -> list:
+    rfm_df = rfm_df.replace([np.inf, -np.inf], np.nan).dropna()
+    cluster_summary = rfm_df.groupby('Cluster').agg({
+        'Frequency': 'mean',
+        'Monetary': 'mean'
+    }).reset_index()
+    if cluster_summary[['Frequency', 'Monetary']].isnull().all().any():
+        return [] 
+    highest_frequency_cluster = int(cluster_summary.loc[cluster_summary['Frequency'].idxmax(), 'Cluster'])
+    highest_amount_cluster = int(cluster_summary.loc[cluster_summary['Monetary'].idxmax(), 'Cluster'])
+    high_freq_stockcodes = rfm_df[rfm_df['Cluster'] == highest_frequency_cluster]['StockCode'].astype(str).tolist()
+    high_amount_stockcodes = rfm_df[rfm_df['Cluster'] == highest_amount_cluster]['StockCode'].astype(str).tolist()
+    high_value_stockcodes = list(set(high_freq_stockcodes + high_amount_stockcodes))
+    product_names = ds[['StockCode', 'Description']].drop_duplicates()
+    high_value_products = product_names[product_names['StockCode'].astype(str).isin(high_value_stockcodes)]
+    return high_value_products.fillna("").to_dict(orient="records")
